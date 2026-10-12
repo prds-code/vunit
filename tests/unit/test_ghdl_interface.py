@@ -286,6 +286,88 @@ warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."""
             ],
         )
 
+    @staticmethod
+    def _simulate(simif, sim_options=None, generics=None, elaborate_only=False):
+        """
+        Simulate tb_entity and return the commands that were run and the result
+        """
+        design_unit = Entity("tb_entity", file_name=str(Path("tempdir") / "file.vhd"))
+        design_unit.generic_names = ["runner_cfg", "width"]
+        config = Configuration("name", design_unit, sim_options=sim_options, generics=generics)
+
+        with mock.patch("vunit.sim_if.ghdl.Process", autospec=True) as process:
+            result = simif.simulate("test_output_path", "tb_entity", config, elaborate_only)
+        return [call[0][0] for call in process.call_args_list], result
+
+    @staticmethod
+    def _create_simif(backend):
+        simif = GHDLInterface(prefix="prefix", output_path="output_path", backend=backend)
+        simif._vhdl_standard = VHDL.standard("2008")  # pylint: disable=protected-access
+        simif._project = Project()  # pylint: disable=protected-access
+        simif._project.add_library("lib", "lib_path")  # pylint: disable=protected-access
+        return simif
+
+    @mock.patch.object(GHDLInterface, "determine_version", return_value=5.0)
+    def test_executable_is_shared_by_the_tests_of_a_design(self, determine_version):
+        for backend in ("gcc", "llvm"):
+            with self.subTest(backend=backend):
+                simif = self._create_simif(backend)
+                ghdl = str(Path("prefix") / "ghdl")
+
+                commands, result = self._simulate(simif, generics={"width": 1})
+                self.assertTrue(result)
+                self.assertEqual(len(commands), 2)
+                link, run = commands
+                executable = link[link.index("-o") + 1]
+                self.assertEqual(link[:2], [ghdl, "-e"])
+                self.assertEqual(link[-2:], ["tb_entity", "arch"])
+                self.assertEqual(Path(executable).name, "tb_entity-arch")
+                self.assertEqual(Path(executable).parents[1], Path("output_path") / "executables")
+                self.assertEqual(run, [executable, "-gwidth=1", "--assert-level=error"])
+
+                # Other generics: the same executable, not linked again
+                commands, _ = self._simulate(simif, generics={"width": 2})
+                self.assertEqual(commands, [[executable, "-gwidth=2", "--assert-level=error"]])
+
+                commands, _ = self._simulate(simif, generics={"width": 2}, elaborate_only=True)
+                self.assertEqual(commands, [[executable, "-gwidth=2", "--assert-level=error", "--no-run"]])
+
+                # Other elaboration flags: another executable
+                commands, _ = self._simulate(simif, sim_options={"ghdl.elab_flags": ["-frelaxed"]})
+                self.assertEqual(len(commands), 2)
+                self.assertEqual(commands[0][:2], [ghdl, "-e"])
+                self.assertIn("-frelaxed", commands[0])
+                self.assertNotEqual(commands[1][0], executable)
+
+    @mock.patch.object(GHDLInterface, "determine_version", return_value=5.0)
+    def test_executable_that_fails_to_link_is_not_linked_again(self, determine_version):
+        simif = self._create_simif("gcc")
+        design_unit = Entity("tb_entity", file_name=str(Path("tempdir") / "file.vhd"))
+        design_unit.generic_names = ["runner_cfg"]
+        config = Configuration("name", design_unit)
+
+        with mock.patch("vunit.sim_if.ghdl.Process", autospec=True) as process:
+            process.NonZeroExitCode = Exception
+            process.return_value.consume_output.side_effect = process.NonZeroExitCode
+            self.assertFalse(simif.simulate("test_output_path", "tb_entity", config, False))
+            self.assertFalse(simif.simulate("test_output_path", "tb_entity", config, False))
+        self.assertEqual(process.call_count, 1)
+
+    @mock.patch.object(GHDLInterface, "determine_version", return_value=5.0)
+    def test_executable_is_not_shared_when_backend_has_no_executable(self, determine_version):
+        ghdl = str(Path("prefix") / "ghdl")
+        for backend in ("mcode", "llvm-jit"):
+            with self.subTest(backend=backend):
+                commands, _ = self._simulate(self._create_simif(backend))
+                self.assertEqual(len(commands), 1)
+                self.assertEqual(commands[0][:2], [ghdl, "--elab-run"])
+
+        # An executable only elaborated on request, and the coverage file of llvm given at elaboration
+        commands, _ = self._simulate(self._create_simif("gcc"), {"ghdl.elab_e": True}, elaborate_only=True)
+        self.assertEqual([command[:2] for command in commands], [[ghdl, "-e"]])
+        commands, _ = self._simulate(self._create_simif("llvm"), {"enable_coverage": True})
+        self.assertEqual([command[:2] for command in commands], [[ghdl, "--elab-run"]])
+
     @mock.patch.object(GHDLInterface, "determine_version", return_value=5.0)
     def test_prefix_is_a_read_only_property(self, determine_version):
         simif = GHDLInterface(prefix="prefix", output_path="")

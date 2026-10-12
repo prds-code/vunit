@@ -203,11 +203,14 @@ The following simulation options are known.
    Must be a string.
 
 ``ghdl.elab_flags``
-   Extra elaboration flags passed to ``ghdl --elab-run``.
+   Extra elaboration flags passed to ``ghdl --elab-run``, or to ``ghdl -e`` with the gcc and
+   llvm backends, where the tests that elaborate the same design with the same flags share
+   one executable.
    Must be a list of strings.
 
 ``ghdl.sim_flags``
-   Extra simulation flags passed to ``ghdl --elab-run``.
+   Extra simulation flags passed to ``ghdl --elab-run``, or to the executable of the design
+   with the gcc and llvm backends.
    Must be a list of strings.
 
 ``ghdl.elab_e``

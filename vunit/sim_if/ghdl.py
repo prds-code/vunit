@@ -15,9 +15,11 @@ import subprocess
 import shlex
 import re
 import shutil
+import threading
 from json import dump
 from sys import stdout  # To avoid output catched in non-verbose mode
 from ..exceptions import CompileError
+from ..hashing import hash_string
 from ..ostools import Process
 from . import SimulatorInterface, ListOfStringOption, StringOption, BooleanOption
 from . import check_executable
@@ -26,6 +28,17 @@ from ._viewermixin import ViewerMixin
 from . import hooks
 
 LOGGER = logging.getLogger(__name__)
+
+
+class _SharedExecutable:
+    """
+    The executable shared by the tests of a design, linked by the first of them
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.link_attempted = False
+        self.path = None  # None when not linked yet or when the linking failed
 
 
 class GHDLInterface(SimulatorInterface, ViewerMixin):  # pylint: disable=too-many-instance-attributes
@@ -121,6 +134,8 @@ class GHDLInterface(SimulatorInterface, ViewerMixin):  # pylint: disable=too-man
         self._coverage_test_dirs = set()  # For gcov
         self._coverage_files = set()  # For --coverage
         self._version = self.determine_version(self.find_prefix())
+        self._executables = {}  # Elaboration arguments -> shared executable
+        self._executables_lock = threading.Lock()
 
     @property
     def backend(self):
@@ -324,12 +339,45 @@ class GHDLInterface(SimulatorInterface, ViewerMixin):  # pylint: disable=too-man
 
         cmd += ["-e"] if ghdl_e else ["--elab-run"]
 
-        cmd += [f"--std={self._std_str(self._vhdl_standard)!s}"]
+        bin_path = str(Path(output_path) / f"{config.entity_name!s}-{config.architecture_name!s}")
+        cmd += self._get_elab_args(config, output_path, bin_path, test_suite_name)
+
+        sim = self._get_sim_args(config, wave_file)
+
+        if not ghdl_e:
+            cmd += sim
+            if elaborate_only:
+                cmd += ["--no-run"]
+        else:
+            try:
+                makedirs(output_path, mode=0o777)
+            except OSError:
+                pass
+            with (Path(output_path) / "args.json").open("w", encoding="utf-8") as fname:
+                dump(
+                    {
+                        "bin": bin_path,
+                        "build": cmd[1:],
+                        "sim": sim,
+                    },
+                    fname,
+                )
+
+        return cmd
+
+    def _get_elab_args(self, config, output_path, bin_path, test_suite_name):
+        """
+        Return the arguments of the elaboration of config: all that follows -e or --elab-run, except
+        the simulation arguments.
+
+        output_path and test_suite_name are only used for the coverage output file of the backends
+        other than gcc
+        """
+        cmd = [f"--std={self._std_str(self._vhdl_standard)!s}"]
         cmd += [f"--work={config.library_name!s}"]
         cmd += [f"--workdir={self._project.get_library(config.library_name).directory!s}"]
         cmd += [f"-P{lib.directory!s}" for lib in self._project.get_libraries()]
 
-        bin_path = str(Path(output_path) / f"{config.entity_name!s}-{config.architecture_name!s}")
         if self._has_output_flag():
             cmd += ["-o", bin_path]
         cmd += config.sim_options.get("ghdl.elab_flags", [])
@@ -347,6 +395,12 @@ class GHDLInterface(SimulatorInterface, ViewerMixin):  # pylint: disable=too-man
         else:
             cmd += [config.entity_name, config.architecture_name]
 
+        return cmd
+
+    def _get_sim_args(self, config, wave_file):
+        """
+        Return the simulation arguments of config
+        """
         sim = list(config.sim_options.get("ghdl.sim_flags", []))
         sim += hooks.get_flags(self, "run_flags")
         for name, value in config.generics.items():
@@ -363,28 +417,58 @@ class GHDLInterface(SimulatorInterface, ViewerMixin):  # pylint: disable=too-man
             elif self._viewer_fmt == "fst":
                 sim += [f"--fst={wave_file!s}"]
 
-        if not ghdl_e:
-            cmd += sim
-            if elaborate_only:
-                cmd += ["--no-run"]
-        else:
-            try:
-                makedirs(output_path, mode=0o777)
-            except OSError:
-                pass
-            with (Path(output_path) / "args.json").open("w", encoding="utf-8") as fname:
-                dump(
-                    {
-                        "bin": str(Path(output_path) / f"{config.entity_name!s}-{config.architecture_name!s}"),
-                        "build": cmd[1:],
-                        "sim": sim,
-                    },
-                    fname,
-                )
+        return sim
 
-        return cmd
+    def _get_executable(self, config):
+        """
+        Return the executable of the design of config, or None when it could not be linked.
 
-    def simulate(self, output_path, test_suite_name, config, elaborate_only):  # pylint: disable=too-many-locals
+        The ahead-of-time linking backends write an executable at elaboration, which only depends
+        on the design and on the elaboration flags: the generics and the test to run are given
+        to it when it is started.  It is linked once and shared by all the tests of a run, as
+        linking takes far longer than most simulations
+        """
+        name = f"{config.entity_name!s}-{config.architecture_name!s}"
+        # The path of the executable follows from the other arguments.  There is no test output path
+        # to give, as _shares_executable leaves out the elaborations that depend on it
+        key = "\0".join(self._get_elab_args(config, None, "", None))
+
+        with self._executables_lock:
+            executable = self._executables.setdefault(key, _SharedExecutable())
+
+        with executable.lock:
+            if not executable.link_attempted:
+                executable.link_attempted = True
+                directory = Path(self._output_path) / "executables" / hash_string(key)
+                shutil.rmtree(directory, ignore_errors=True)
+                makedirs(directory, exist_ok=True)
+                bin_path = str(directory / name)
+                cmd = [str(Path(self._prefix) / self.executable), "-e"]
+                cmd += self._get_elab_args(config, None, bin_path, None)
+                try:
+                    # In the environment of the simulation, as when both are done by --elab-run
+                    Process(cmd, env=hooks.get_run_env(self)).consume_output()
+                    executable.path = bin_path
+                except Process.NonZeroExitCode:
+                    pass
+            elif executable.path is None:
+                # The output of the linker is in the output of the test that ran it
+                print(f"The executable of {name} could not be linked, see the first test that failed")
+
+            return executable.path
+
+    def _shares_executable(self, config, ghdl_e):
+        """
+        Return if the tests of config are run with a shared executable
+        """
+        if ghdl_e or not self._has_output_flag():
+            return False
+        # The other backends take the coverage output file at elaboration
+        return self._backend == "gcc" or not config.sim_options.get("enable_coverage", False)
+
+    def simulate(
+        self, output_path, test_suite_name, config, elaborate_only
+    ):  # pylint: disable=too-many-locals,too-many-branches
         """
         Simulate with entity as top level using generics
         """
@@ -403,7 +487,15 @@ class GHDLInterface(SimulatorInterface, ViewerMixin):  # pylint: disable=too-man
         else:
             data_file_name = None
 
-        cmd = self._get_command(config, script_path, elaborate_only, ghdl_e, test_suite_name, data_file_name)
+        if self._shares_executable(config, ghdl_e):
+            executable = self._get_executable(config)
+            if executable is None:
+                return False
+            cmd = [executable] + self._get_sim_args(config, data_file_name)
+            if elaborate_only:
+                cmd += ["--no-run"]
+        else:
+            cmd = self._get_command(config, script_path, elaborate_only, ghdl_e, test_suite_name, data_file_name)
 
         status = True
 
